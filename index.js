@@ -3,56 +3,131 @@ const ddb = new AWS.DynamoDB.DocumentClient();
 const { DCC } = require('dcc-utils');
 const axios = require('axios');
 const rs = require('jsrsasign');
+const rules = require('./rules');
+
 exports.handler = async (event) => {
+    let qr_code = '';
+    
+    if(event.qr_code !== undefined){
+      qr_code = event.qr_code;
+    }else{
+      const postParams = new URLSearchParams(event.body);
+      qr_code = postParams.get("qr_code");
+    }
+    
     let dcc;
 
     try {
-        dcc = await DCC.fromRaw(event.qr_code);
+        dcc = await DCC.fromRaw(qr_code);
     } catch (error) {
-        // XXX ERRORE DCC NON VALIDO
-        console.log('errore', error)
+        console.error('green pass parser failed', error);
+
+        return {
+            statusCode: 200,
+            body: JSON.stringify({
+                validation: false,
+                parse_valid: false
+            })
+        };
     }
 
     let certAndSettings = await getCertAndSettings();
     let certificates = certAndSettings.certs;
     let settings = certAndSettings.settings;
 
-    // XXX aggiungere gestione errori ovunque
-    let verified = false;
-    let verifier;
-    for (let certificate of certificates) {
-        try {
-            verifier = rs.KEYUTIL.getKey(certificate).getPublicKeyXYHex();
-            verified = await dcc.checkSignature(verifier);
-        } catch{ }
-        
-        if(verified) {
-            break;
+    let parse_valid = false;
+
+    if (dcc.payload.v) {
+        parse_valid = rules.checkVacRules(settings, dcc.payload.v[dcc.payload.v.length - 1]);
+    }
+
+    if (dcc.payload.t) {
+        parse_valid = rules.checkTestRules(settings, dcc.payload.t[dcc.payload.t.length - 1]);
+    }
+
+    if (dcc.payload.r) {
+        parse_valid = rules.checkRecRules(settings, dcc.payload.r[dcc.payload.r.length - 1]);
+    }
+
+    let validation = false;
+    
+    if (parse_valid) { // controllo la signature solo se il green pass non è scaduto
+
+        for (let certificate of certificates) {
+            try {
+                //XXX Attenzione qua se non va il certificato svizzero rifarsi al sistema Dentella (prevede di aggiornare cose-js alla versione 0.7.0)
+                validation = rs.KEYUTIL.getKey(certificate).getPublicKeyXYHex();
+                validation = await dcc.checkSignature(verifier);
+            } catch { }
+
+            if (validation) {
+                break;
+            }
+
+            // ------------- Sistema Dentella
+            //     try {
+
+            //         // get key and jwk from certificate
+            //         key = rs.KEYUTIL.getKey(certificate);
+            //         jwk = rs.KEYUTIL.getJWKFromKey(key);
+
+            //         // EC key, the library expects x and y coordinates as hex strings
+            //         if(jwk.kty == 'EC') {
+            //             verifier = {
+            //                 x: Buffer.from(jwk.x, 'base64').toString('hex'),
+            //                 y: Buffer.from(jwk.y, 'base64').toString('hex')
+            //             };
+            //         }
+
+            //         // RSA key, the library expects modulus and exponent as Buffers
+            //         else if(jwk.kty == 'RSA') {
+            //             verifier = {
+            //                 n: Buffer.from(jwk.n, 'base64'),
+            //                 e: Buffer.from(jwk.e, 'base64')
+            //             };
+            //         }
+
+            //         verified = await dcc.checkSignature(verifier);
+            //     } catch {}
+            //     if(verified) break;
+
+
         }
+
+        // -------------- Metodo async che li verifica tutti ma molto lento
+        // let array_verifiers = await Promise.allSettled(certificates.map(async (cert)=>{
+        //     let result = false
+        //     try {
+        //         result = await dcc.checkSignature(rs.KEYUTIL.getKey(cert).getPublicKeyXYHex());
+        //     } catch (error) {
+
+        //     }
+
+        //     if(result){
+        //         return 'valido'
+        //     }else{
+        //         return false
+        //     }
+        // }));
+
+        // array_verifiers.forEach(r => {
+        //     if(r.status == 'fulfilled' && r.value == 'valido'){
+        //         verified = true;
+        //     }
+        // })
     }
 
-    let validated = false;
 
-    if(verified){
-        if(dcc.payload.v){
-            validated = checkVacRules(settings, dcc.payload.v);
-        }   
-
-        // if(dcc.payload.t){
-        //     validated = checkTestRules(settings, dcc);
-        // } 
-
-        // if(dcc.payload.r){
-        //     validated = checkRecRules(settings, dcc);
-        // } 
-    }
 
     const response = {
         statusCode: 200,
         body: JSON.stringify({
-            verified: verified ? true : false,
-            validated: validated,
-            dcc: dcc.payload
+            validation: validation ? true : false,
+            parse_valid: parse_valid,
+            dati: {
+                nome: dcc.payload.nam.gn,
+                cognome: dcc.payload.nam.fn
+            }
         }),
     };
 
@@ -79,8 +154,13 @@ const getCertAndSettings = async () => {
 
     let certs = await ddb.scan(params).promise().then(r => {
         let array_certs = [];
+        // in dynamodb fetcho i certificati anche dal governo svedese che li divide per nazione. Così posso mettere come primo certificato da verififcare quelli italiani.
         r.Items.forEach(item => {
-            array_certs.push(item.cert);
+            if (item.it) {
+                array_certs.unshift(item.cert);
+            } else {
+                array_certs.push(item.cert);
+            }
         });
 
         return array_certs
@@ -95,9 +175,12 @@ const getCertAndSettings = async () => {
 
         certs = await ddb.scan(params).promise().then(r => {
             let array_certs = [];
-
             r.Items.forEach(item => {
-                array_certs.push(item.cert);
+                if (item.it) {
+                    array_certs.unshift(item.cert);
+                } else {
+                    array_certs.push(item.cert);
+                }
             });
 
             return array_certs
@@ -106,67 +189,16 @@ const getCertAndSettings = async () => {
 
     let settings;
 
-    if(!cert_status.settings){
+    if (!cert_status.settings) {
         let url_settings = process.env.URL_SETTINGS;
         let fetch_settings = await axios.get(url_settings);
         settings = fetch_settings.data;
-    }else{
+    } else {
         settings = cert_status.settings
     }
 
     return {
         certs: certs,
         settings: settings
-    }
-}
-
-const checkVacRules = (settings, data) =>{
-    let vaccineType = data.mp;
-    let doseNumber = data.dn;
-    let dateOfVaccination = data.dt;
-    let totalSeriesOfDoses = data.sd;
-    let now = new Date().getTime();
-
-    //XXX aggiungere gestione degli errori. 
-
-    if(doseNumber < totalSeriesOfDoses) {
-        let vaccine_start_day_not_complete = settings.find(rule => {
-            return rule.name == 'vaccine_start_day_not_complete' && rule.type == vaccineType
-        })
-        let vaccine_end_day_not_complete = settings.find(rule => {
-            return rule.name == 'vaccine_end_day_not_complete' && rule.type == vaccineType
-        })
-			
-        let startDate = new Date(dateOfVaccination);
-        startDate.setDate(startDate.getDate() + vaccine_start_day_not_complete);
-        let endDate = new Date(dateOfVaccination);
-        endDate.setDate(endDate.getDate() + vaccine_end_day_not_complete);
-
-        if(startDate.getTime() > now || endDate.getTime() < now){
-            return false
-        }else{
-            return true
-        }
-        
-    }
-    
-    if(doseNumber >= totalSeriesOfDoses) {
-        let vaccine_start_day_complete = settings.find(rule => {
-            return rule.name == 'vaccine_start_day_complete' && rule.type == vaccineType
-        })
-        let vaccine_end_day_complete = settings.find(rule => {
-            return rule.name == 'vaccine_end_day_complete' && rule.type == vaccineType
-        })
-			
-        let startDate = new Date(dateOfVaccination);
-        startDate.setDate(startDate.getDate() + vaccine_start_day_complete);
-        let endDate = new Date(dateOfVaccination);
-        endDate.setDate(endDate.getDate() + vaccine_end_day_complete);
-
-        if(startDate.getTime() > now || endDate.getTime() < now){
-            return false
-        }else{
-            return true
-        }
     }
 }
